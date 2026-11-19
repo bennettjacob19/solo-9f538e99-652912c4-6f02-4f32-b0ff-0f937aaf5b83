@@ -66,6 +66,52 @@
   </section>
 
   <section class="card">
+    <h2>成组切换（原子发布）</h2>
+    <p class="muted small">
+      用于互相调用的服务一起换地址：勾选 2～10 个现有服务并填写各自的新地址，
+      整组要么一起生效、要么一起不变，客户端不会看到新旧混搭。
+      若组内任一服务在你看到的版本之后被修改、删除或经备份恢复（即使地址又改回相同值），
+      整组会被拒绝并提示冲突；其他服务的改动不影响发布。
+      请求号是幂等键：网络重试或重复提交同一请求号只会返回首次结果，不会重复发布。
+    </p>
+    {% if state.services|length >= 2 %}
+    <form method="post" action="{{ url_for('form_group_switch') }}">
+      <table>
+        <thead><tr><th>选择</th><th>服务名</th><th>当前地址</th><th>新地址</th></tr></thead>
+        <tbody>
+        {% for row in state.services %}
+          <tr>
+            <td><input type="checkbox" name="row" value="{{ loop.index0 }}"
+                       aria-label="选择 {{ row.service }}"></td>
+            <td class="mono">{{ row.service }}
+              <input type="hidden" name="service_{{ loop.index0 }}" value="{{ row.service }}"></td>
+            <td class="mono small">{{ row.address }}</td>
+            <td><input name="address_{{ loop.index0 }}" maxlength="512"
+                       value="{{ row.address }}"></td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      <div class="grid">
+        <label>所见目录版本
+          <input name="seen_version" required inputmode="numeric" pattern="[0-9]+"
+                 value="{{ state.version }}">
+        </label>
+        <label>请求号（幂等键）
+          <input name="request_id" required maxlength="64" value="{{ switch_request_id }}">
+        </label>
+        <label>备注（可选）
+          <input name="note" maxlength="200" placeholder="变更原因">
+        </label>
+        <button type="submit">整组发布</button>
+      </div>
+    </form>
+    {% else %}
+    <p class="muted">目录中至少需要有 2 个服务才能成组切换。</p>
+    {% endif %}
+  </section>
+
+  <section class="card">
     <h2>命名备份</h2>
     <form method="post" action="{{ url_for('form_create_backup') }}" class="inline">
       <input name="name" required maxlength="64" placeholder="例如 pre-change-2026-11-18">
@@ -103,7 +149,7 @@
 
   <section class="card">
     <h2>查询 API</h2>
-    <p class="mono small">GET /resolve?name=&lt;服务名&gt; &nbsp;·&nbsp; GET /resolve（返回整个目录）</p>
+    <p class="mono small">GET /resolve?name=&lt;服务名&gt; &nbsp;·&nbsp; GET /resolve（返回整个目录）&nbsp;·&nbsp; POST /api/switch（成组切换）</p>
   </section>
 </main>
 </body>

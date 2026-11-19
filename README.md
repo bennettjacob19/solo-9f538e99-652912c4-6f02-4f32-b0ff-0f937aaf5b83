@@ -1,8 +1,8 @@
 # 本地服务发现目录（svcdir）
 
 一个运行在 Flask + SQLite 上的小型服务发现目录：运维人员可以在网页上修改
-「服务名 → 目标地址」的映射、创建命名备份、并从一个备份恢复。另有 `/resolve`
-查询 API 供客户端使用。
+「服务名 → 目标地址」的映射、把互相调用的 2～10 个服务**成组原子切换**到新地址、
+创建命名备份、并从一个备份恢复。另有 `/resolve` 查询 API 供客户端使用。
 
 ## 启动
 
@@ -38,19 +38,63 @@ SVCDIR_DB=./data/directory.sqlite3 python3 -m svcdir   # 开发用内置服务�
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/` | 网页：目录、修改表单、备份列表、恢复按钮 |
+| GET | `/` | 网页：目录、修改表单、成组切换、备份列表、恢复按钮 |
 | GET | `/resolve?name=<服务名>` | 返回单个服务的地址 |
 | GET | `/resolve` | 返回整个当前目录 |
 | GET | `/api/state` | 当前版本、完整目录、恢复状态、备份列表 |
 | GET | `/api/backups` | 备份列表 |
 | POST | `/api/services` | `{"service": ..., "address": ..., "note": ...}` 新增/修改 |
 | DELETE | `/api/services/<名>` | 删除 |
+| POST | `/api/switch` | 成组原子切换（见下） |
 | POST | `/api/backups` | `{"name": ...}` 创建命名备份 |
 | GET | `/api/backups/<名>/validate` | 校验备份（不修改目录） |
 | POST | `/api/backups/<名>/restore` | 从备份恢复 |
 
-浏览器表单走 `POST /services`、`/backups`、`/backups/<名>/restore`，
+浏览器表单走 `POST /services`、`/switch`、`/backups`、`/backups/<名>/restore`，
 成功后 303 跳回页面并显示结果或错误。
+
+### 成组切换（原子发布）
+
+互相调用的服务要一起换地址时，在网页勾选 2～10 个现有服务、填写各自的新地址、
+所见目录版本和请求号（页面已按当前版本预填后两者），一次提交整组发布；
+也可以用 API：
+
+```json
+POST /api/switch
+{
+  "request_id": "sw-2026-001",
+  "seen_version": 6,
+  "changes": [
+    {"service": "orders-api", "address": "10.1.0.11:8080"},
+    {"service": "billing-api", "address": "10.1.0.12:8080"}
+  ]
+}
+```
+
+成功响应（`replayed` 区分首次发布与重放）：
+
+```json
+{"ok": true, "request_id": "sw-2026-001", "version": 7, "previous_version": 6,
+ "services": {"orders-api": "10.1.0.11:8080", "billing-api": "10.1.0.12:8080"},
+ "replayed": false}
+```
+
+语义：
+
+- **整组原子**：所有成员的新地址写进一个完整的新目录版本，一次提交发布；
+  `/resolve` 单名查询与全目录查询只会看到切换前或切换后的完整组合，
+  永远不会看到新旧混搭。失败（校验、冲突、进程崩溃）不会留下半组。
+- **冲突检测**：提交后若组内任一服务在 `seen_version` 之后被修改、删除或
+  经备份恢复——即使地址又改回相同值——整组返回 `409 switch_conflict`，
+  目录不变；组外服务的任何改动不阻止发布。重新读取目录后用新的
+  `seen_version` 重试即可。
+- **幂等重试**：`request_id` 是幂等键。同号同内容重试（网络重试、双击、
+  重启后重发）返回首次结果，即使目录后来又变过也不会重复发布；
+  同号异内容返回 `409 request_id_conflict`。幂等记录与版本切换在同一个
+  事务里落盘，重启后不丢。
+- **与恢复交错**：恢复进行中新的切换返回 `409 restore_in_progress`；
+  已完成的切换在恢复期间重放仍返回首次结果。恢复本身会把全目录标记为
+  「已变更」，因此恢复之后基于旧 `seen_version` 的切换必然冲突。
 
 查询响应示例：
 
@@ -85,6 +129,16 @@ SVCDIR_DB=./data/directory.sqlite3 python3 -m svcdir   # 开发用内置服务�
   内核释放锁，重启后立即回收被遗弃的「恢复中」标记，不必等租约到期。
 - **并发恢复。** 文件锁 + 数据库内的 `restore_state` 双重互斥，第二个恢复请求
   得到 409。
+- **成组切换的冲突检测基于「触碰版本」而非地址值。** `service_touches` 表记录
+  每个服务最后一次被修改、删除、恢复或成组切换时的目录版本——即使新地址与旧
+  地址相同也照记。切换请求携带 `seen_version`，组内任一服务的触碰版本大于它
+  即整组冲突；恢复会触碰恢复前后的全部服务，所以恢复之后旧视角的切换必然
+  冲突。组外服务的触碰不参与判断。
+- **成组切换的幂等记录与发布同事务。** `group_requests` 表保存
+  「请求号 → 内容指纹（seen_version + 全部成员地址的 SHA-256）+ 首次结果」，
+  与新版本、`current_version` 切换在同一事务提交：崩溃要么都落盘要么都不，
+  重启后同号重试只重放首次结果，不会重复发布；同号异内容直接 409。
+  只有成功的发布才占用请求号，失败的尝试可修正后用同号重试。
 
 ## 测试
 
@@ -109,25 +163,48 @@ python3 -m pytest -q
 - `test_live_restore_lease_survives_sibling_process_initialization`
 - `test_backup_row_pins_one_version_during_continuous_writes`
 - `test_http_rejects_writes_and_serves_reads_during_restore`
-- `test_api_flow` / `test_html_page_and_forms` / `test_html_escapes_hostile_names`
+- 成组切换：`test_group_switch_publishes_one_complete_version`、
+  `test_modified_member_conflicts_but_unrelated_changes_do_not`、
+  `test_member_changed_back_to_same_address_still_conflicts`、
+  `test_deleted_member_conflicts_even_when_recreated_identically`、
+  `test_restore_after_seen_conflicts_even_with_identical_addresses`、
+  `test_failed_switch_leaves_no_partial_group`、
+  `test_same_request_replays_first_result_even_after_directory_changes`、
+  `test_replay_returns_first_result_even_after_restore`、
+  `test_same_request_id_with_different_content_rejected`、
+  `test_request_record_survives_restart`、
+  `test_concurrent_identical_requests_publish_exactly_once`、
+  `test_crash_mid_switch_leaves_no_partial_group_and_retry_publishes_once`、
+  `test_readers_see_only_complete_combinations_around_switch`、
+  `test_read_view_opened_before_switch_keeps_old_combination`、
+  `test_switch_rejected_during_restore_but_completed_request_replays`、
+  `test_switch_interleaved_with_writes_and_restore`、
+  `test_schema_v1_database_is_migrated`
+- `test_api_flow` / `test_api_switch_flow` / `test_html_page_and_forms` /
+  `test_html_group_switch_form` / `test_html_escapes_hostile_names`
 - `test_api_validation_errors_are_json` / `test_edge_case_inputs_are_rejected_cleanly`
 
 ## 布局
 
 ```
 svcdir/errors.py     错误类型 → HTTP 状态码
-svcdir/store.py      目录版本、命名备份、校验、恢复（核心逻辑）
+svcdir/store.py      目录版本、成组切换、命名备份、校验、恢复（核心逻辑）
 svcdir/web.py        Flask 路由：网页 + API
 svcdir/templates/    页面模板
 tests/test_svcdir.py 自测（含并发交错）
 Dockerfile / docker-compose.yml
 ```
 
+数据库 schema 为 v2；打开 v1 的旧数据库文件时会自动迁移（新增
+`service_touches` 与 `group_requests` 两表，并重放不可变版本历史回填各服务
+的最后变更版本），目录数据与备份不受影响。
+
 ## 已知限制与未完成项
 
 - **未在 Docker 中实际构建/运行。** 本环境没有 Docker（`docker` 命令不存在），
   因此 Dockerfile 与 compose 文件只做了静态检查。应用本身已用
-  `python -m svcdir` 与 gunicorn 在真实 HTTP 上跑通。
+  `python -m svcdir` 与 gunicorn 在真实 HTTP 上跑通（含成组切换、幂等重放、
+  进程重启后不重复发布）。
 - 单容器部署，恢复互斥依赖同一文件系统上的 `flock`；若把数据目录放到不支持
   `flock` 的网络文件系统，会退化为「租约到期才算失效」。
 - 备份保存在同一 SQLite 数据库中，可防止误改目录，但不能防磁盘/文件损坏；

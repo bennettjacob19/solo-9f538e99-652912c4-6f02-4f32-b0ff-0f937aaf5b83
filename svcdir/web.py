@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 from pathlib import Path
 
 from flask import Flask, jsonify, redirect, render_template, request, url_for
@@ -144,6 +145,19 @@ def create_app(store: DirectoryStore | None = None, *, config: dict | None = Non
     def api_delete(service: str):
         return jsonify({"ok": True, **store.delete(service)})
 
+    @app.post("/api/switch")
+    def api_group_switch():
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            raise InputError("请求体必须是 JSON 对象")
+        result = store.group_switch(
+            payload.get("changes"),
+            payload.get("seen_version"),
+            payload.get("request_id"),
+            payload.get("note", ""),
+        )
+        return jsonify({"ok": True, **result}), 200
+
     @app.post("/api/backups")
     def api_create_backup():
         payload = request.get_json(silent=True)
@@ -169,8 +183,13 @@ def create_app(store: DirectoryStore | None = None, *, config: dict | None = Non
     @app.get("/")
     def index():
         snapshot = store.snapshot()
-        return render_template("index.html", state=snapshot, message=request.args.get("message"),
-                               error=request.args.get("error"))
+        return render_template(
+            "index.html",
+            state=snapshot,
+            switch_request_id=f"sw-{snapshot['version']}-{secrets.token_hex(4)}",
+            message=request.args.get("message"),
+            error=request.args.get("error"),
+        )
 
     @app.post("/services")
     def form_upsert():
@@ -191,6 +210,34 @@ def create_app(store: DirectoryStore | None = None, *, config: dict | None = Non
         except DirectoryError as exc:
             return _redirect_back(error=exc.message)
         return _redirect_back(message=f"已删除 {result['service']}（目录版本 {result['version']}）")
+
+    @app.post("/switch")
+    def form_group_switch():
+        try:
+            changes = [
+                {
+                    "service": request.form.get(f"service_{index}"),
+                    "address": request.form.get(f"address_{index}"),
+                }
+                for index in request.form.getlist("row")
+            ]
+            result = store.group_switch(
+                changes,
+                request.form.get("seen_version"),
+                request.form.get("request_id"),
+                request.form.get("note", ""),
+            )
+        except DirectoryError as exc:
+            return _redirect_back(error=exc.message)
+        if result["replayed"]:
+            return _redirect_back(
+                message=f"请求号 {result['request_id']} 的切换此前已成功，本次为重复提交，"
+                        f"未再次发布（目录版本 {result['version']}）"
+            )
+        return _redirect_back(
+            message=f"已整组切换 {len(result['services'])} 个服务："
+                    f"{', '.join(result['services'])}（目录版本 {result['version']}）"
+        )
 
     @app.post("/backups")
     def form_create_backup():

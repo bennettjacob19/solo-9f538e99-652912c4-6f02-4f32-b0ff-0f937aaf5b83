@@ -17,6 +17,15 @@ Design summary
 * While a restore holds a live lease, writes are rejected with
   ``RestoreInProgress``.  An expired lease (crashed restorer) is reclaimed, and
   a restorer that lost its lease aborts instead of overwriting newer state.
+* A grouped switch publishes new addresses for 2~10 services as one atomic
+  version: readers only ever see the complete combination before or after.
+  ``service_touches`` remembers the last version that touched each service
+  (even if the address came out identical), so a member changed, deleted or
+  restored after the caller's seen version fails the whole group with a
+  conflict, while unrelated services never block it.  ``group_requests``
+  stores the idempotency record (request number -> content fingerprint and
+  first result) in the same commit as the version switch, so retries replay
+  the first result and a restart never re-publishes.
 """
 
 from __future__ import annotations
@@ -47,17 +56,23 @@ from .errors import (
     DirectoryError,
     InputError,
     NotFoundError,
+    RequestIdConflict,
     RestoreInProgress,
+    SwitchConflict,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 BACKUP_FORMAT = "svcdir-backup-v1"
 MAX_SERVICES = 5000
 MAX_ADDRESS_LENGTH = 512
 MAX_BACKUP_NAME_LENGTH = 64
 MAX_NOTE_LENGTH = 200
+MIN_GROUP_SIZE = 2
+MAX_GROUP_SIZE = 10
+MAX_REQUEST_ID_LENGTH = 64
 
 SERVICE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
+REQUEST_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}\Z")
 DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
 
 _RESTORE_KEYS = (
@@ -117,6 +132,67 @@ def _clean_note(raw: Any) -> str:
     if not isinstance(raw, str):
         return ""
     return raw.strip()[:MAX_NOTE_LENGTH]
+
+
+def validate_request_id(raw: Any) -> str:
+    request_id = _text(raw, "请求号")
+    if not REQUEST_ID_RE.fullmatch(request_id):
+        raise InputError(
+            "请求号不合法：需以字母或数字开头，仅可包含字母、数字、'_'、'.'、':'、'-'，"
+            f"长度 1-{MAX_REQUEST_ID_LENGTH}"
+        )
+    return request_id
+
+
+def _parse_seen_version(raw: Any) -> int:
+    if isinstance(raw, bool):
+        raise InputError("所见目录版本必须是正整数")
+    if isinstance(raw, int):
+        value = raw
+    elif isinstance(raw, str) and raw.strip().isdigit():
+        value = int(raw.strip())
+    else:
+        raise InputError("所见目录版本必须是正整数")
+    if value < 1:
+        raise InputError("所见目录版本必须是正整数")
+    return value
+
+
+def _parse_switch_changes(raw: Any) -> tuple[tuple[str, str], ...]:
+    if isinstance(raw, dict) or not isinstance(raw, (list, tuple)):
+        raise InputError("changes 必须是成员数组")
+    if not MIN_GROUP_SIZE <= len(raw) <= MAX_GROUP_SIZE:
+        raise InputError(
+            f"成组切换需要 {MIN_GROUP_SIZE}~{MAX_GROUP_SIZE} 个服务，实际 {len(raw)} 个"
+        )
+    members: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            raise InputError("每个切换成员必须是包含 service 与 address 的对象")
+        service = validate_service_name(item.get("service"))
+        address = validate_address(item.get("address"))
+        if service in seen:
+            raise InputError(f"组内服务重复: {service}")
+        seen.add(service)
+        members.append((service, address))
+    return tuple(members)
+
+
+def _switch_fingerprint(
+    seen_version: int, members: tuple[tuple[str, str], ...], note: str
+) -> str:
+    payload = json.dumps(
+        {
+            "seen_version": seen_version,
+            "note": note,
+            "changes": [{"service": s, "address": a} for s, a in sorted(members)],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _utc_now_iso() -> str:
@@ -295,7 +371,14 @@ class DirectoryStore:
         ).fetchone()
         if has_meta:
             row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
-            if row is None or str(row["value"]) != str(SCHEMA_VERSION):
+            try:
+                version = int(str(row["value"])) if row is not None else -1
+            except ValueError:
+                version = -1
+            if version == 1:
+                self._migrate_v1_to_v2(conn)
+                version = 2
+            if version != SCHEMA_VERSION:
                 raise RuntimeError(
                     f"数据库 schema 版本不兼容：期望 {SCHEMA_VERSION}，实际 "
                     f"{None if row is None else row['value']}"
@@ -338,6 +421,7 @@ class DirectoryStore:
             )
             """
         )
+        self._create_switch_tables(conn)
         now = _utc_now_iso()
         cur = conn.execute(
             "INSERT INTO versions(created_at, kind, note) VALUES (?, 'initial', '初始空目录')",
@@ -347,6 +431,62 @@ class DirectoryStore:
         self._meta_set(conn, "schema_version", str(SCHEMA_VERSION))
         self._meta_set(conn, "current_version", str(initial_version))
         self._meta_set(conn, "restore_state", "idle")
+
+    @staticmethod
+    def _create_switch_tables(conn: sqlite3.Connection) -> None:
+        # service_touches: the last version that *touched* each service
+        # (upsert/delete/restore/group switch — recorded even when the new
+        # address equals the old one, so value-identity never hides a change).
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS service_touches (
+                service TEXT PRIMARY KEY,
+                version_id INTEGER NOT NULL REFERENCES versions(id) ON DELETE RESTRICT
+            )
+            """
+        )
+        # group_requests: durable idempotency records for grouped switches.
+        # Written in the same transaction as the version switch, so a crash
+        # can never leave a published switch without its record (or vice
+        # versa) and a restart never re-publishes.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS group_requests (
+                request_id TEXT PRIMARY KEY,
+                fingerprint TEXT NOT NULL,
+                result TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+
+    def _migrate_v1_to_v2(self, conn: sqlite3.Connection) -> None:
+        self._create_switch_tables(conn)
+        # Reconstruct each service's last-changing version by replaying the
+        # immutable version history.  Value-diffing is the best signal
+        # available for versions written before touches were recorded.
+        previous: dict[str, str] = {}
+        last_change: dict[str, int] = {}
+        version_ids = [
+            int(r["id"]) for r in conn.execute("SELECT id FROM versions ORDER BY id")
+        ]
+        for version_id in version_ids:
+            current = {
+                str(r["service"]): str(r["address"])
+                for r in conn.execute(
+                    "SELECT service, address FROM entries WHERE version_id=?",
+                    (version_id,),
+                )
+            }
+            for service in set(previous) | set(current):
+                if previous.get(service) != current.get(service):
+                    last_change[service] = version_id
+            previous = current
+        conn.executemany(
+            "INSERT OR IGNORE INTO service_touches(service, version_id) VALUES (?, ?)",
+            sorted(last_change.items()),
+        )
+        self._meta_set(conn, "schema_version", str(SCHEMA_VERSION))
 
     # -- meta helpers -----------------------------------------------------
 
@@ -514,6 +654,20 @@ class DirectoryStore:
         ).fetchall()
         return tuple((str(r["service"]), str(r["address"])) for r in rows)
 
+    @staticmethod
+    def _touch(conn: sqlite3.Connection, services, version_id: int) -> None:
+        """Record that ``services`` changed as of ``version_id``.
+
+        Touches are recorded for every write — even when the new address
+        equals the old one — so a later grouped switch can tell "unchanged
+        since you looked" apart from "changed and changed back".
+        """
+        conn.executemany(
+            "INSERT INTO service_touches(service, version_id) VALUES (?, ?) "
+            "ON CONFLICT(service) DO UPDATE SET version_id=excluded.version_id",
+            [(service, version_id) for service in services],
+        )
+
     def _fire(self, name: str, payload: dict) -> None:
         hook = self._hooks.get(name)
         if hook is not None:
@@ -616,6 +770,7 @@ class DirectoryStore:
                 "ON CONFLICT(version_id, service) DO UPDATE SET address=excluded.address",
                 (new_version, svc, addr),
             )
+            self._touch(conn, (svc,), new_version)
             self._set_current(conn, new_version)
         return {
             "version": new_version,
@@ -639,6 +794,7 @@ class DirectoryStore:
             )
             if cur.rowcount == 0:
                 raise NotFoundError(f"未知服务: {svc}")
+            self._touch(conn, (svc,), new_version)
             self._set_current(conn, new_version)
         return {
             "version": new_version,
@@ -646,6 +802,116 @@ class DirectoryStore:
             "service": svc,
             "deleted": True,
         }
+
+    # -- grouped atomic switch ---------------------------------------------
+
+    def group_switch(
+        self,
+        changes: Any,
+        seen_version: Any,
+        request_id: Any,
+        note: Any = "",
+    ) -> dict:
+        """Atomically publish new addresses for 2~10 existing services.
+
+        * Conflict: if any member was touched (modified, deleted, or restored
+          — even back to the same address) after ``seen_version``, the whole
+          group is rejected and nothing is written.  Changes to services
+          outside the group never block the switch.
+        * Atomic: the new complete version, the per-service touch records and
+          the idempotency record commit in one transaction, so a failure or a
+          crash never leaves half a group behind.
+        * Idempotent: the same request number with the same content replays
+          the first result (even if the directory moved on since); the same
+          number with different content is rejected.
+        """
+        members = _parse_switch_changes(changes)
+        seen = _parse_seen_version(seen_version)
+        req_id = validate_request_id(request_id)
+        clean_note = _clean_note(note)
+        fingerprint = _switch_fingerprint(seen, members, clean_note)
+        names = [service for service, _ in members]
+        placeholders = ", ".join("?" for _ in names)
+        self._ensure_ready()
+        replayed = False
+        with self._txn(write=True) as conn:
+            row = conn.execute(
+                "SELECT fingerprint, result FROM group_requests WHERE request_id=?",
+                (req_id,),
+            ).fetchone()
+            if row is not None:
+                if not hmac.compare_digest(str(row["fingerprint"]), fingerprint):
+                    raise RequestIdConflict(
+                        f"请求号 {req_id} 已用于一次内容不同的切换，请更换请求号"
+                    )
+                result = json.loads(str(row["result"]))
+                replayed = True
+            else:
+                self._require_writable(conn)
+                current = self._current_version(conn)
+                if seen > current:
+                    raise SwitchConflict(
+                        f"所见目录版本 {seen} 高于当前版本 {current}，请刷新后重试"
+                    )
+                touches = {
+                    str(r["service"]): int(r["version_id"])
+                    for r in conn.execute(
+                        f"SELECT service, version_id FROM service_touches "
+                        f"WHERE service IN ({placeholders})",
+                        names,
+                    )
+                }
+                stale = sorted(
+                    (name, touches[name]) for name in names if touches.get(name, 0) > seen
+                )
+                if stale:
+                    raise SwitchConflict(
+                        f"组内服务在版本 {seen} 之后已被修改、删除或恢复，整组发布已拒绝",
+                        details=[
+                            f"{name} 最近变更于版本 {version}" for name, version in stale
+                        ],
+                    )
+                existing = {
+                    str(r["service"])
+                    for r in conn.execute(
+                        f"SELECT service FROM entries "
+                        f"WHERE version_id=? AND service IN ({placeholders})",
+                        [current, *names],
+                    )
+                }
+                missing = sorted(name for name in names if name not in existing)
+                if missing:
+                    raise NotFoundError(f"未知服务: {', '.join(missing)}")
+                new_version = self._create_version(
+                    conn,
+                    current,
+                    "switch",
+                    clean_note or f"成组切换 {len(members)} 个服务（请求号 {req_id}）",
+                )
+                conn.executemany(
+                    "UPDATE entries SET address=? WHERE version_id=? AND service=?",
+                    [(address, new_version, service) for service, address in members],
+                )
+                self._touch(conn, names, new_version)
+                self._set_current(conn, new_version)
+                result = {
+                    "request_id": req_id,
+                    "version": new_version,
+                    "previous_version": current,
+                    "services": {service: address for service, address in members},
+                }
+                conn.execute(
+                    "INSERT INTO group_requests(request_id, fingerprint, result, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        req_id,
+                        fingerprint,
+                        json.dumps(result, ensure_ascii=False, sort_keys=True),
+                        _utc_now_iso(),
+                    ),
+                )
+        result["replayed"] = replayed
+        return result
 
     def create_backup(self, name: Any) -> dict:
         backup_name = validate_backup_name(name)
@@ -848,9 +1114,17 @@ class DirectoryStore:
                     )
                 validated = self._validate_backup(conn, backup_name)
                 previous = self._current_version(conn)
+                old_services = {service for service, _ in self._entries(conn, previous)}
                 new_version = self._create_version(
                     conn, validated.version_id, "restore", f"恢复备份 {backup_name}"
                 )
+                restored_services = {
+                    service for service, _ in self._entries(conn, new_version)
+                }
+                # A restore replaces the whole directory: every service that
+                # exists before or after counts as touched, even when its
+                # address comes out identical.
+                self._touch(conn, old_services | restored_services, new_version)
                 self._set_current(conn, new_version)
                 self._clear_restore(conn)
 

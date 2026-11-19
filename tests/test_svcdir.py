@@ -12,8 +12,11 @@ from svcdir import DirectoryStore, create_app
 from svcdir.errors import (
     BackupValidationError,
     ConflictError,
+    InputError,
     NotFoundError,
+    RequestIdConflict,
     RestoreInProgress,
+    SwitchConflict,
 )
 
 
@@ -781,3 +784,475 @@ def test_html_escapes_hostile_names(client):
     resp = client.get("/")
     assert resp.headers["X-Content-Type-Options"] == "nosniff"
     assert "script-src 'self'" in resp.headers["Content-Security-Policy"]
+
+
+# ---------------------------------------------------------------------------
+# Grouped atomic switch
+# ---------------------------------------------------------------------------
+
+
+def switch(store: DirectoryStore, pairs: dict[str, str], seen: int, req: str) -> dict:
+    return store.group_switch(
+        [{"service": s, "address": a} for s, a in pairs.items()], seen, req
+    )
+
+
+def test_group_switch_publishes_one_complete_version(store):
+    seed(store, {"a": "old-a", "b": "old-b", "c": "keep"})
+    seen = store.resolve()["version"]
+    result = switch(store, {"a": "new-a", "b": "new-b"}, seen, "req-basic")
+    assert result["replayed"] is False
+    assert result["previous_version"] == seen
+    assert result["services"] == {"a": "new-a", "b": "new-b"}
+    after = store.resolve()
+    assert after["version"] == result["version"]
+    assert after["services"] == {"a": "new-a", "b": "new-b", "c": "keep"}
+    single = store.resolve("a")
+    assert single["address"] == "new-a"
+    assert single["version"] == result["version"]
+
+
+def test_switch_group_size_boundaries(store):
+    seed(store, {f"s{i}": str(i) for i in range(10)})
+    seen = store.resolve()["version"]
+    result = switch(store, {"s0": "x", "s1": "y"}, seen, "req-two")
+    assert result["services"] == {"s0": "x", "s1": "y"}
+    seen = store.resolve()["version"]
+    result = switch(store, {f"s{i}": f"v{i}" for i in range(10)}, seen, "req-ten")
+    assert len(result["services"]) == 10
+    assert store.resolve()["services"] == {f"s{i}": f"v{i}" for i in range(10)}
+
+
+def test_switch_input_validation(store):
+    seed(store, {f"s{i}": str(i) for i in range(12)})
+    seen = store.resolve()["version"]
+    # Group size limits: 1 is too few, 11 too many.
+    with pytest.raises(InputError):
+        switch(store, {"s0": "x"}, seen, "req-v1")
+    with pytest.raises(InputError):
+        switch(store, {f"s{i}": "x" for i in range(11)}, seen, "req-v2")
+    # Duplicate member inside one group.
+    with pytest.raises(InputError):
+        store.group_switch(
+            [{"service": "s0", "address": "x"}, {"service": "s0", "address": "y"}],
+            seen, "req-v3",
+        )
+    # Malformed request ids.
+    for bad in ["", "has space", "x" * 65, "-leading-dash", 7, None]:
+        with pytest.raises(InputError):
+            switch(store, {"s0": "x", "s1": "y"}, seen, bad)
+    # Malformed seen versions.
+    for bad in [0, -3, "abc", "", None, 1.5, True]:
+        with pytest.raises(InputError):
+            switch(store, {"s0": "x", "s1": "y"}, bad, "req-v4")
+    # Malformed changes payload.
+    with pytest.raises(InputError):
+        store.group_switch("nope", seen, "req-v5")
+    with pytest.raises(InputError):
+        store.group_switch({"s0": "x", "s1": "y"}, seen, "req-v6")
+    with pytest.raises(InputError):
+        store.group_switch([{"service": "s0"}, {"service": "s1", "address": "y"}],
+                           seen, "req-v7")
+    # Validation failures changed nothing.
+    assert store.resolve()["version"] == seen
+
+
+def test_unknown_member_is_404(store):
+    seed(store, {"a": "1", "b": "2"})
+    seen = store.resolve()["version"]
+    with pytest.raises(NotFoundError):
+        switch(store, {"a": "10", "ghost": "20"}, seen, "req-ghost")
+
+
+def test_seen_version_from_the_future_conflicts(store):
+    seed(store, {"a": "1", "b": "2"})
+    current = store.resolve()["version"]
+    with pytest.raises(SwitchConflict):
+        switch(store, {"a": "10", "b": "20"}, current + 5, "req-future")
+
+
+def test_modified_member_conflicts_but_unrelated_changes_do_not(store):
+    seed(store, {"a": "1", "b": "2", "c": "3"})
+    seen = store.resolve()["version"]
+    # Changes outside the group never block the switch.
+    store.upsert("c", "changed")
+    store.upsert("d", "new")
+    store.delete("d")
+    result = switch(store, {"a": "10", "b": "20"}, seen, "req-unrelated")
+    assert result["replayed"] is False
+    assert store.resolve()["services"] == {"a": "10", "b": "20", "c": "changed"}
+    # A change to a member after the seen version conflicts the whole group.
+    seen = store.resolve()["version"]
+    store.upsert("b", "moved")
+    with pytest.raises(SwitchConflict) as excinfo:
+        switch(store, {"a": "100", "b": "200"}, seen, "req-member-moved")
+    assert any("b" in d for d in excinfo.value.details)
+
+
+def test_member_changed_back_to_same_address_still_conflicts(store):
+    seed(store, {"a": "1", "b": "2"})
+    seen = store.resolve()["version"]
+    store.upsert("a", "different")
+    store.upsert("a", "1")  # back to the exact address the operator saw
+    assert store.resolve("a")["address"] == "1"
+    with pytest.raises(SwitchConflict):
+        switch(store, {"a": "10", "b": "20"}, seen, "req-same-value")
+
+
+def test_deleted_member_conflicts_even_when_recreated_identically(store):
+    seed(store, {"a": "1", "b": "2"})
+    seen = store.resolve()["version"]
+    store.delete("a")
+    with pytest.raises(SwitchConflict):
+        switch(store, {"a": "10", "b": "20"}, seen, "req-del-1")
+    store.upsert("a", "1")  # re-created with the same address: still a change
+    with pytest.raises(SwitchConflict):
+        switch(store, {"a": "10", "b": "20"}, seen, "req-del-2")
+
+
+def test_restore_after_seen_conflicts_even_with_identical_addresses(store):
+    seed(store, {"a": "1", "b": "2", "c": "3"})
+    store.create_backup("snap")  # backup content identical to the live directory
+    seen = store.resolve()["version"]
+    store.restore_backup("snap")
+    assert store.resolve()["services"] == {"a": "1", "b": "2", "c": "3"}
+    with pytest.raises(SwitchConflict):
+        switch(store, {"a": "10", "b": "20"}, seen, "req-restore-conflict")
+
+
+def test_failed_switch_leaves_no_partial_group(store):
+    seed(store, {"a": "1", "b": "2", "c": "3"})
+    seen = store.resolve()["version"]
+    store.upsert("b", "changed")
+    before = store.resolve()
+    with pytest.raises(SwitchConflict):
+        switch(store, {"a": "10", "b": "20"}, seen, "req-fail")
+    after = store.resolve()
+    assert after["version"] == before["version"]
+    assert after["services"] == before["services"]
+    # The failed attempt recorded nothing: the same request id may be reused
+    # once the operator re-reads the directory.
+    result = switch(store, {"a": "10", "b": "20"}, before["version"], "req-fail")
+    assert result["replayed"] is False
+
+
+def test_same_request_replays_first_result_even_after_directory_changes(store):
+    seed(store, {"a": "1", "b": "2", "c": "3"})
+    seen = store.resolve()["version"]
+    pairs = {"a": "10", "b": "20"}
+    first = switch(store, pairs, seen, "req-idem")
+    # The directory moves on, group members included.
+    store.upsert("a", "50")
+    store.upsert("c", "60")
+    store.delete("c")
+    replay = switch(store, pairs, seen, "req-idem")
+    assert replay["replayed"] is True
+    assert replay["version"] == first["version"]
+    assert replay["services"] == pairs
+    # The replay did not publish anything again.
+    assert store.resolve("a")["address"] == "50"
+
+
+def test_replay_returns_first_result_even_after_restore(store):
+    seed(store, {"a": "1", "b": "2"})
+    store.create_backup("snap")
+    seen = store.resolve()["version"]
+    pairs = {"a": "10", "b": "20"}
+    first = switch(store, pairs, seen, "req-restore-replay")
+    store.restore_backup("snap")  # directory goes back to a=1, b=2
+    replay = switch(store, pairs, seen, "req-restore-replay")
+    assert replay["replayed"] is True
+    assert replay["version"] == first["version"]
+    assert store.resolve()["services"] == {"a": "1", "b": "2"}
+
+
+def test_same_request_id_with_different_content_rejected(store):
+    seed(store, {"a": "1", "b": "2"})
+    seen = store.resolve()["version"]
+    switch(store, {"a": "10", "b": "20"}, seen, "req-dup")
+    with pytest.raises(RequestIdConflict):
+        switch(store, {"a": "11", "b": "20"}, seen, "req-dup")
+    # A different seen version with the same id is different content too.
+    with pytest.raises(RequestIdConflict):
+        switch(store, {"a": "10", "b": "20"}, seen + 1, "req-dup")
+    # And a different member set.
+    with pytest.raises(RequestIdConflict):
+        switch(store, {"a": "10", "c": "20"}, seen, "req-dup")
+
+
+def test_request_record_survives_restart(tmp_path):
+    db = tmp_path / "dir.sqlite3"
+    store = DirectoryStore(db)
+    seed(store, {"a": "1", "b": "2"})
+    seen = store.resolve()["version"]
+    pairs = {"a": "10", "b": "20"}
+    first = switch(store, pairs, seen, "req-restart")
+    store.upsert("a", "99")
+
+    restarted = DirectoryStore(db)
+    replay = switch(restarted, pairs, seen, "req-restart")
+    assert replay["replayed"] is True
+    assert replay["version"] == first["version"]
+    # No duplicate publish after the restart.
+    assert restarted.resolve("a")["address"] == "99"
+    with pytest.raises(RequestIdConflict):
+        switch(restarted, {"a": "10", "b": "21"}, seen, "req-restart")
+
+
+def test_concurrent_identical_requests_publish_exactly_once(store):
+    seed(store, {"a": "1", "b": "2"})
+    seen = store.resolve()["version"]
+    pairs = {"a": "10", "b": "20"}
+    results: list[dict] = []
+    errors: list[Exception] = []
+
+    def submit():
+        try:
+            results.append(switch(store, pairs, seen, "req-race"))
+        except Exception as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=submit) for _ in range(6)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+    assert not errors
+    assert len(results) == 6
+    assert {r["version"] for r in results} == {results[0]["version"]}
+    assert sum(1 for r in results if not r["replayed"]) == 1
+    assert store.resolve()["version"] == results[0]["version"]
+
+
+def test_crash_mid_switch_leaves_no_partial_group_and_retry_publishes_once(
+    store, monkeypatch
+):
+    seed(store, {"a": "1", "b": "2", "c": "3"})
+    seen = store.resolve()["version"]
+    pairs = {"a": "10", "b": "20"}
+    original_create_version = store._create_version
+
+    def boom(conn, source_version, kind, note):
+        raise RuntimeError("simulated crash inside switch")
+
+    monkeypatch.setattr(store, "_create_version", boom)
+    with pytest.raises(RuntimeError):
+        switch(store, pairs, seen, "req-crash")
+    monkeypatch.setattr(store, "_create_version", original_create_version)
+
+    after = store.resolve()
+    assert after["version"] == seen
+    assert after["services"] == {"a": "1", "b": "2", "c": "3"}
+    # The crashed attempt left no record, so the retry publishes exactly once.
+    result = switch(store, pairs, seen, "req-crash")
+    assert result["replayed"] is False
+    assert store.resolve()["services"] == {"a": "10", "b": "20", "c": "3"}
+    replay = switch(store, pairs, seen, "req-crash")
+    assert replay["replayed"] is True
+    assert replay["version"] == result["version"]
+    assert store.resolve()["version"] == result["version"]
+
+
+def test_readers_see_only_complete_combinations_around_switch(store):
+    seed(store, {"a": "a0", "b": "b0", "c": "keep"})
+    stop = threading.Event()
+    problems: list[dict] = []
+
+    def reader():
+        while not stop.is_set():
+            snap = store.resolve()["services"]
+            a, b = snap.get("a", ""), snap.get("b", "")
+            if snap.get("c") != "keep" or not (a[1:] == b[1:] and a[0] == "a" and b[0] == "b"):
+                problems.append(snap)
+
+    readers = [threading.Thread(target=reader) for _ in range(3)]
+    for thread in readers:
+        thread.start()
+    for i in range(1, 15):
+        seen = store.resolve()["version"]
+        switch(store, {"a": f"a{i}", "b": f"b{i}"}, seen, f"req-gen-{i}")
+    stop.set()
+    for thread in readers:
+        thread.join(10)
+    assert not problems, problems
+    assert store.resolve()["services"] == {"a": "a14", "b": "b14", "c": "keep"}
+
+
+def test_read_view_opened_before_switch_keeps_old_combination(store):
+    seed(store, {"a": "old-a", "b": "old-b"})
+    seen = store.resolve()["version"]
+    with store.read_view() as view:
+        first = view.resolve()
+        switch(store, {"a": "new-a", "b": "new-b"}, seen, "req-pin")
+        second = view.resolve()
+        assert first["services"] == second["services"] == {"a": "old-a", "b": "old-b"}
+        assert first["version"] == second["version"]
+    assert store.resolve()["services"] == {"a": "new-a", "b": "new-b"}
+
+
+def test_switch_rejected_during_restore_but_completed_request_replays(store):
+    seed(store, {"a": "old-a", "b": "old-b"})
+    store.create_backup("snap")
+    seed(store, {"a": "live-a", "b": "live-b"})
+    seen = store.resolve()["version"]
+    done = switch(store, {"a": "x", "b": "y"}, seen, "req-done")
+    current = store.resolve()["version"]
+
+    gate = BlockingHooks().install(store, "validated")
+    thread = threading.Thread(target=store.restore_backup, args=("snap",))
+    thread.start()
+    assert gate.reached.wait(10)
+    try:
+        with pytest.raises(RestoreInProgress):
+            switch(store, {"a": "p", "b": "q"}, current, "req-during-restore")
+        replay = switch(store, {"a": "x", "b": "y"}, seen, "req-done")
+        assert replay["replayed"] is True
+        assert replay["version"] == done["version"]
+    finally:
+        gate.release.set()
+        thread.join(10)
+    assert store.resolve()["services"] == {"a": "old-a", "b": "old-b"}
+
+
+def test_switch_interleaved_with_writes_and_restore(store):
+    seed(store, {"a": "1", "b": "2", "c": "3"})
+    store.create_backup("snap")
+    v1 = store.resolve()["version"]
+    store.upsert("c", "30")  # unrelated change: does not block
+    first = switch(store, {"a": "10", "b": "20"}, v1, "req-i1")
+    assert store.resolve()["services"] == {"a": "10", "b": "20", "c": "30"}
+    # A restore touches every service: switches based on older versions fail.
+    store.restore_backup("snap")
+    assert store.resolve()["services"] == {"a": "1", "b": "2", "c": "3"}
+    with pytest.raises(SwitchConflict):
+        switch(store, {"a": "10", "b": "20"}, first["version"], "req-i2")
+    # A switch based on the restored version succeeds.
+    current = store.resolve()["version"]
+    switch(store, {"a": "10", "b": "20"}, current, "req-i3")
+    assert store.resolve()["services"] == {"a": "10", "b": "20", "c": "3"}
+    # The first request id still replays its original result.
+    replay = switch(store, {"a": "10", "b": "20"}, v1, "req-i1")
+    assert replay["replayed"] is True
+    assert replay["version"] == first["version"]
+
+
+def test_schema_v1_database_is_migrated(tmp_path):
+    db = tmp_path / "old.sqlite3"
+    store = DirectoryStore(db)
+    seed(store, {"a": "1", "b": "2", "c": "3"})
+    current = store.resolve()["version"]
+    # Pretend this database predates the switch feature.
+    with sqlite3.connect(db) as conn:
+        conn.execute("DROP TABLE service_touches")
+        conn.execute("DROP TABLE group_requests")
+        conn.execute("UPDATE meta SET value='1' WHERE key='schema_version'")
+
+    reopened = DirectoryStore(db)
+    reopened.initialize()
+    with sqlite3.connect(db) as conn:
+        version = conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'"
+        ).fetchone()[0]
+    assert version == "2"
+    # Touches were backfilled from history: a switch based on the current
+    # version succeeds, one based on an older version conflicts.
+    result = switch(reopened, {"a": "10", "b": "20"}, current, "req-mig-1")
+    assert result["services"] == {"a": "10", "b": "20"}
+    with pytest.raises(SwitchConflict):
+        switch(reopened, {"a": "x", "b": "y"}, 1, "req-mig-2")
+
+
+def test_api_switch_flow(client):
+    client.post("/api/services", json={"service": "a", "address": "1"})
+    client.post("/api/services", json={"service": "b", "address": "2"})
+    client.post("/api/services", json={"service": "c", "address": "3"})
+    seen = client.get("/api/state").get_json()["version"]
+    payload = {
+        "request_id": "req-http-1",
+        "seen_version": seen,
+        "changes": [
+            {"service": "a", "address": "10.0.0.1:80"},
+            {"service": "b", "address": "10.0.0.2:80"},
+        ],
+    }
+    resp = client.post("/api/switch", json=payload)
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["ok"] is True
+    assert body["replayed"] is False
+    new_version = body["version"]
+    full = client.get("/resolve").get_json()
+    assert full["version"] == new_version
+    assert full["services"] == {"a": "10.0.0.1:80", "b": "10.0.0.2:80", "c": "3"}
+    assert client.get("/resolve?name=a").get_json()["address"] == "10.0.0.1:80"
+    # Same number, same content: replay of the first result.
+    replay = client.post("/api/switch", json=payload).get_json()
+    assert replay["replayed"] is True
+    assert replay["version"] == new_version
+    assert client.get("/api/state").get_json()["version"] == new_version
+    # Same number, different content: rejected.
+    changed = dict(payload, changes=[{"service": "a", "address": "x"},
+                                     {"service": "b", "address": "y"}])
+    resp = client.post("/api/switch", json=changed)
+    assert resp.status_code == 409
+    assert resp.get_json()["error"]["code"] == "request_id_conflict"
+    # A member moved after the seen version: whole group conflicts.
+    client.post("/api/services", json={"service": "a", "address": "moved"})
+    resp = client.post("/api/switch", json={
+        "request_id": "req-http-2", "seen_version": seen,
+        "changes": [{"service": "a", "address": "p"}, {"service": "b", "address": "q"}],
+    })
+    assert resp.status_code == 409
+    assert resp.get_json()["error"]["code"] == "switch_conflict"
+    # Unknown member and malformed payloads.
+    current = client.get("/api/state").get_json()["version"]
+    resp = client.post("/api/switch", json={
+        "request_id": "req-http-3", "seen_version": current,
+        "changes": [{"service": "a", "address": "p"}, {"service": "ghost", "address": "q"}],
+    })
+    assert resp.status_code == 404
+    assert client.post("/api/switch", data="hello").status_code == 400
+    assert client.post("/api/switch", json={"request_id": "req-x"}).status_code == 400
+
+
+def test_html_group_switch_form(client):
+    client.post("/services", data={"service": "a", "address": "1"})
+    client.post("/services", data={"service": "b", "address": "2"})
+    page = client.get("/").get_data(as_text=True)
+    assert "成组切换" in page
+    assert 'name="seen_version"' in page
+    assert 'name="request_id"' in page
+
+    seen = client.get("/api/state").get_json()["version"]
+    form = {
+        "row": ["0", "1"],
+        "service_0": "a", "address_0": "10.0.0.1",
+        "service_1": "b", "address_1": "10.0.0.2",
+        "seen_version": str(seen),
+        "request_id": "req-form-1",
+        "note": "",
+    }
+    resp = client.post("/switch", data=form, follow_redirects=False)
+    assert resp.status_code == 303
+    assert client.get("/resolve?name=a").get_json()["address"] == "10.0.0.1"
+    assert client.get("/resolve?name=b").get_json()["address"] == "10.0.0.2"
+    version_after_first = client.get("/api/state").get_json()["version"]
+
+    # Re-submitting the identical form replays instead of publishing again.
+    page = client.post("/switch", data=form, follow_redirects=True)
+    assert "重复提交" in page.get_data(as_text=True)
+    assert client.get("/api/state").get_json()["version"] == version_after_first
+
+    # A stale seen version surfaces the conflict on the page.
+    client.post("/services", data={"service": "a", "address": "moved"})
+    page = client.post("/switch", data={
+        "row": ["0", "1"],
+        "service_0": "a", "address_0": "1.1.1.1",
+        "service_1": "b", "address_1": "2.2.2.2",
+        "seen_version": str(seen),
+        "request_id": "req-form-2",
+    }, follow_redirects=True)
+    text = page.get_data(as_text=True)
+    assert "整组发布已拒绝" in text
+    assert client.get("/resolve?name=a").get_json()["address"] == "moved"
+    assert client.get("/resolve?name=b").get_json()["address"] == "10.0.0.2"

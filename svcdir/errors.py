@@ -55,6 +55,20 @@ class BackupNameTaken(ConflictError):
     code = "backup_name_taken"
 
 
+class SwitchConflict(ConflictError):
+    """A grouped switch found a member changed after the seen version."""
+
+    status_code = 409
+    code = "switch_conflict"
+
+
+class RequestIdConflict(ConflictError):
+    """The request number was already used with different content."""
+
+    status_code = 409
+    code = "request_id_conflict"
+
+
 class BackupValidationError(DirectoryError):
     status_code = 422
     code = "invalid_backup"
